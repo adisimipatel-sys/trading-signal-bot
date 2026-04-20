@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Trading Signal Bot - Crypto + Indian Stocks
-Signals only (no auto-trade), Telegram alerts, Web dashboard
+Auto-trade on Binance, Telegram alerts, Web dashboard
 """
 
-import asyncio
+import hashlib
+import hmac
 import json
 import os
 import time
@@ -12,26 +13,202 @@ import math
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlencode
 import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY", "demo")
-OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")   # GPT-5.2 / gpt-4o-mini fallback
-SCAN_INTERVAL_MIN  = int(os.getenv("SCAN_INTERVAL_MIN", "10"))
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+ALPHA_VANTAGE_KEY   = os.getenv("ALPHA_VANTAGE_KEY", "demo")
+OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY", "")
+SCAN_INTERVAL_MIN   = int(os.getenv("SCAN_INTERVAL_MIN", "10"))
+BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY  = os.getenv("BINANCE_SECRET_KEY", "")
+
+# Auto-trade settings
+AUTO_TRADE_ENABLED  = bool(BINANCE_API_KEY and BINANCE_SECRET_KEY)
+TRADE_AMOUNT_USDT   = 13.0  # ~₹1000 in USDT
+MIN_CONFIDENCE      = 70    # Only trade if confidence >= 70%
+BINANCE_BASE_URL    = "https://api.binance.com"
+
+# ─── BINANCE AUTO-TRADE ───────────────────────────────────────────────────────
+
+def binance_signature(params: dict) -> str:
+    query = urlencode(params)
+    return hmac.new(
+        BINANCE_SECRET_KEY.encode(),
+        query.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+def binance_request(method: str, endpoint: str, params: dict = {}) -> dict:
+    """Make signed request to Binance API"""
+    params["timestamp"] = int(time.time() * 1000)
+    params["signature"] = binance_signature(params)
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+    url = BINANCE_BASE_URL + endpoint
+    try:
+        if method == "GET":
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+        elif method == "POST":
+            r = requests.post(url, params=params, headers=headers, timeout=10)
+        elif method == "DELETE":
+            r = requests.delete(url, params=params, headers=headers, timeout=10)
+        return r.json()
+    except Exception as e:
+        logger.error(f"Binance API error: {e}")
+        return {}
+
+def get_binance_price(symbol: str) -> Optional[float]:
+    """Get current price from Binance"""
+    try:
+        r = requests.get(f"{BINANCE_BASE_URL}/api/v3/ticker/price",
+                         params={"symbol": symbol}, timeout=5)
+        return float(r.json()["price"])
+    except:
+        return None
+
+def get_symbol_info(symbol: str) -> dict:
+    """Get min qty and step size for symbol"""
+    try:
+        r = requests.get(f"{BINANCE_BASE_URL}/api/v3/exchangeInfo",
+                         params={"symbol": symbol}, timeout=10)
+        data = r.json()
+        filters = data["symbols"][0]["filters"]
+        lot = next(f for f in filters if f["filterType"] == "LOT_SIZE")
+        notional = next((f for f in filters if f["filterType"] == "MIN_NOTIONAL"), {})
+        return {
+            "minQty":   float(lot["minQty"]),
+            "stepSize": float(lot["stepSize"]),
+            "minNotional": float(notional.get("minNotional", 5.0))
+        }
+    except:
+        return {"minQty": 0.001, "stepSize": 0.001, "minNotional": 5.0}
+
+def round_step(qty: float, step: float) -> float:
+    """Round quantity to valid step size"""
+    precision = len(str(step).rstrip('0').split('.')[-1])
+    return round(round(qty / step) * step, precision)
+
+def place_binance_order(symbol: str, side: str, usdt_amount: float, signal: dict) -> dict:
+    """Place market order + OCO (stop loss + target) on Binance"""
+    if not AUTO_TRADE_ENABLED:
+        logger.info(f"  Auto-trade disabled — skipping order for {symbol}")
+        return {}
+
+    price = get_binance_price(symbol)
+    if not price:
+        logger.error(f"  Could not get price for {symbol}")
+        return {}
+
+    info     = get_symbol_info(symbol)
+    qty      = round_step(usdt_amount / price, info["stepSize"])
+
+    if qty < info["minQty"]:
+        logger.warning(f"  Qty {qty} below minQty {info['minQty']} for {symbol} — skipping")
+        return {}
+
+    logger.info(f"  🔄 Placing {side} order: {qty} {symbol} @ ~{price}")
+
+    # Place market order
+    order_params = {
+        "symbol":   symbol,
+        "side":     side,
+        "type":     "MARKET",
+        "quantity": qty,
+    }
+    order = binance_request("POST", "/api/v3/order", order_params)
+
+    if "orderId" not in order:
+        logger.error(f"  ❌ Order failed: {order}")
+        return {}
+
+    logger.info(f"  ✅ Order placed! ID: {order['orderId']}")
+
+    # Place stop loss order
+    targets = signal.get("targets", {})
+    sl_price = targets.get("stop_loss")
+    t1_price = targets.get("target1")
+
+    if sl_price and t1_price and side == "BUY":
+        try:
+            sl_side = "SELL"
+            sl_params = {
+                "symbol":      symbol,
+                "side":        sl_side,
+                "type":        "STOP_LOSS_LIMIT",
+                "quantity":    qty,
+                "price":       round(sl_price * 0.999, 2),
+                "stopPrice":   round(sl_price, 2),
+                "timeInForce": "GTC",
+            }
+            sl_order = binance_request("POST", "/api/v3/order", sl_params)
+            logger.info(f"  🛡️ Stop Loss set @ {sl_price}")
+        except Exception as e:
+            logger.warning(f"  Stop loss order failed: {e}")
+
+    return order
+
+def notify_trade_telegram(symbol: str, side: str, qty: float,
+                           price: float, signal: dict, order: dict):
+    """Send trade execution notification to Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    emoji = "🟢" if side == "BUY" else "🔴"
+    t = signal.get("targets", {})
+    msg = f"""
+⚡ <b>AUTO-TRADE EXECUTED!</b> ⚡
+
+{emoji} <b>{side}</b> {symbol}
+<b>Quantity:</b> {qty}
+<b>Price:</b> ~{price:,.4f} USDT
+<b>Amount:</b> ~₹1000
+
+<b>📊 Levels:</b>
+• Stop Loss: {t.get('stop_loss', 'N/A')}
+• Target 1: {t.get('target1', 'N/A')}
+• Target 2: {t.get('target2', 'N/A')}
+
+<b>Order ID:</b> {order.get('orderId', 'N/A')}
+<i>⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
+<i>⚠️ Auto-trade executed by bot</i>
+""".strip()
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+    except Exception as e:
+        logger.error(f"Trade notification error: {e}")
 
 # Symbols to scan
 CRYPTO_SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
     "ADAUSDT","DOGEUSDT","AVAXUSDT","DOTUSDT","MATICUSDT"
 ]
+
+# Nifty 50 stocks (Yahoo Finance NSE symbols)
 INDIAN_SYMBOLS = [
-    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK",
-    "WIPRO","LT","AXISBANK","SBIN","BAJFINANCE"
+    "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK",
+    "HINDUNILVR","ITC","SBIN","BHARTIARTL","KOTAKBANK",
+    "LT","AXISBANK","ASIANPAINT","MARUTI","TITAN",
+    "SUNPHARMA","ULTRACEMCO","WIPRO","NESTLEIND","TECHM",
+    "BAJFINANCE","HCLTECH","POWERGRID","NTPC","ONGC",
+    "TATAMOTORS","TATASTEEL","JSWSTEEL","BAJAJFINSV","ADANIENT"
+]
+
+# Options trading index symbols (for Nifty/BankNifty options signals)
+OPTIONS_SYMBOLS = [
+    {"name": "NIFTY",     "yahoo": "^NSEI"},
+    {"name": "BANKNIFTY", "yahoo": "^NSEBANK"},
+    {"name": "SENSEX",    "yahoo": "^BSESN"},
 ]
 
 # ─── DATA LAYER ───────────────────────────────────────────────────────────────
@@ -510,19 +687,31 @@ def scan_crypto():
             logger.info(f"  ⚡ SIGNAL: {symbol} {signal['direction']} ({signal['confidence']}%)")
             add_signal(signal)
             send_telegram(signal)
+
+            # AUTO-TRADE on Binance if confidence is high enough
+            if AUTO_TRADE_ENABLED and signal["confidence"] >= MIN_CONFIDENCE:
+                side = "BUY" if signal["direction"] == "BUY" else "SELL"
+                price = get_binance_price(symbol)
+                if price:
+                    order = place_binance_order(symbol, side, TRADE_AMOUNT_USDT, signal)
+                    if order:
+                        notify_trade_telegram(symbol, side,
+                            float(order.get("executedQty", 0)),
+                            price, signal, order)
+
             new_signals.append(signal)
-        time.sleep(0.5)  # rate limit
+        time.sleep(0.5)
     return new_signals
 
 
 def scan_indian_stocks():
-    logger.info("🔍 Scanning Indian stocks...")
+    logger.info("🔍 Scanning Nifty 50 stocks...")
     new_signals = []
     for symbol in INDIAN_SYMBOLS:
         logger.info(f"  Analyzing {symbol}...")
-        candles = get_indian_stock_candles(symbol)
+        candles = get_indian_stock_yahoo(symbol)
         if not candles:
-            candles = get_indian_stock_yahoo(symbol)
+            candles = get_indian_stock_candles(symbol)
         if not candles:
             continue
         signal = generate_signal(symbol, "INDIA", candles)
@@ -531,7 +720,149 @@ def scan_indian_stocks():
             add_signal(signal)
             send_telegram(signal)
             new_signals.append(signal)
-        time.sleep(1.0)  # rate limit for Alpha Vantage
+        time.sleep(0.5)
+    return new_signals
+
+
+def get_index_candles_yahoo(yahoo_symbol: str) -> list[dict]:
+    """Fetch index data (Nifty/BankNifty/Sensex) from Yahoo Finance"""
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(yahoo_symbol)
+        hist = ticker.history(period="3mo", interval="1d")
+        candles = []
+        for ts, row in hist.iterrows():
+            candles.append({
+                "time":   ts.timestamp(),
+                "open":   float(row["Open"]),
+                "high":   float(row["High"]),
+                "low":    float(row["Low"]),
+                "close":  float(row["Close"]),
+                "volume": float(row["Volume"]) if row["Volume"] > 0 else 1000000,
+            })
+        return candles
+    except Exception as e:
+        logger.error(f"Index fetch error {yahoo_symbol}: {e}")
+        return []
+
+
+def send_options_signal_telegram(name: str, direction: str, price: float,
+                                  ind: dict, score: int, confidence: int):
+    """Send formatted options trading signal to Telegram"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    rsi  = ind["rsi"]
+    bb   = ind["bollinger"]
+
+    # Options recommendation based on direction
+    if direction == "BUY":
+        option_type = "CALL (CE) 📈"
+        strike_hint = f"ATM or slightly OTM CE"
+        emoji = "🟢"
+    else:
+        option_type = "PUT (PE) 📉"
+        strike_hint = f"ATM or slightly OTM PE"
+        emoji = "🔴"
+
+    # Suggest expiry
+    expiry_hint = "Weekly expiry (nearest Thursday)"
+
+    msg = f"""
+🎯 <b>OPTIONS SIGNAL</b> 🎯
+
+<b>Index:</b> {name}
+<b>Spot Price:</b> {price:,.2f}
+<b>Signal:</b> {emoji} {option_type}
+<b>Confidence:</b> {confidence}%
+<b>Score:</b> {score}/10
+
+<b>📋 Options Strategy:</b>
+• Buy: <b>{strike_hint}</b>
+• Expiry: {expiry_hint}
+• Entry: At market open / current price
+
+<b>📊 Key Levels:</b>
+• RSI: {rsi} {'(Oversold)' if rsi < 35 else '(Overbought)' if rsi > 65 else '(Neutral)'}
+• BB Upper: {bb['upper']:,.0f}
+• BB Lower: {bb['lower']:,.0f}
+
+<b>⚠️ Risk Management:</b>
+• Max loss: 20-30% of premium
+• Book partial profit at 50% gain
+• Exit if spot crosses Stop Level
+
+<i>⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}</i>
+<i>⚠️ Not financial advice. Options are high risk!</i>
+""".strip()
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        if r.status_code == 200:
+            logger.info(f"  ✅ Options signal sent for {name}")
+    except Exception as e:
+        logger.error(f"  ❌ Options telegram error: {e}")
+
+
+def scan_options():
+    """Scan Nifty/BankNifty/Sensex for options trading signals"""
+    logger.info("🎯 Scanning Options (Nifty/BankNifty/Sensex)...")
+    new_signals = []
+
+    for opt in OPTIONS_SYMBOLS:
+        name   = opt["name"]
+        yahoo  = opt["yahoo"]
+        logger.info(f"  Analyzing {name}...")
+
+        candles = get_index_candles_yahoo(yahoo)
+        if not candles:
+            continue
+
+        ind = compute_indicators(candles)
+        if not ind:
+            continue
+
+        scored     = score_indicators(ind)
+        score      = scored["score"]
+        confidence = min(int(abs(score) / 10 * 100), 95)
+
+        # Options signals: lower threshold (score >= 4) since indices move less
+        if abs(score) < 4:
+            logger.info(f"  {name}: score={score} — below threshold, skipping")
+            continue
+
+        direction = "BUY" if score > 0 else "SELL"
+        price     = ind["price"]
+
+        logger.info(f"  ⚡ OPTIONS SIGNAL: {name} {direction} CE/PE ({confidence}%)")
+
+        # Save as signal
+        signal = {
+            "id":           f"{name}_OPT_{int(time.time())}",
+            "symbol":       f"{name} OPTIONS",
+            "market":       "OPTIONS",
+            "direction":    direction,
+            "price":        price,
+            "confidence":   confidence,
+            "score":        score,
+            "indicators":   ind,
+            "signals_list": scored["signals"],
+            "ai_reasoning": f"{'CALL' if direction=='BUY' else 'PUT'} recommended based on technical score {score}/10",
+            "targets":      {"entry": price, "stop_loss": 0, "target1": 0, "target2": 0, "risk_reward": 2},
+            "timestamp":    datetime.now().isoformat(),
+            "status":       "ACTIVE",
+            "result":       None,
+        }
+        add_signal(signal)
+        send_options_signal_telegram(name, direction, price, ind, score, confidence)
+        new_signals.append(signal)
+        time.sleep(0.5)
+
     return new_signals
 
 
@@ -540,14 +871,15 @@ def run_scan():
     logger.info(f"🚀 Starting scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"{'='*50}")
 
-    crypto_signals = scan_crypto()
-    stock_signals  = scan_indian_stocks()
+    crypto_signals  = scan_crypto()
+    stock_signals   = scan_indian_stocks()
+    options_signals = scan_options()
 
-    total = len(crypto_signals) + len(stock_signals)
+    total = len(crypto_signals) + len(stock_signals) + len(options_signals)
     stats = get_win_rate()
     logger.info(f"\n✅ Scan complete. {total} new signals generated.")
     logger.info(f"📊 Win rate: {stats['win_rate']}% ({stats['wins']}/{stats['closed']} closed)")
-    return crypto_signals + stock_signals
+    return crypto_signals + stock_signals + options_signals
 
 
 def main():
@@ -556,6 +888,7 @@ def main():
     logger.info(f"📱 Telegram: {'✅ configured' if TELEGRAM_BOT_TOKEN else '❌ not configured'}")
     logger.info(f"🔑 Alpha Vantage: {'✅ configured' if ALPHA_VANTAGE_KEY != 'demo' else '⚠️  demo key'}")
     logger.info(f"🤖 AI Analysis: {'✅ OpenAI' if OPENAI_API_KEY else '⚠️  rule-based fallback'}")
+    logger.info(f"⚡ Auto-Trade: {'✅ ENABLED (Binance) — ₹1000/trade' if AUTO_TRADE_ENABLED else '❌ disabled (no Binance keys)'}")
 
     while True:
         try:
